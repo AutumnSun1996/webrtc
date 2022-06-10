@@ -1,0 +1,94 @@
+<html>
+
+<head>
+  <title>play-from-disk-ivf</title>
+</head>
+
+<body>
+  <select name="codec" id="codec">
+    <option value="vp8">VP8</option>
+    <option value="vp9">VP9</option>
+    <option value="av1">AV1</option>
+  </select>
+  <button id="start" disabled onclick="window.startSession()"> Start Session </button><br />
+  <h3> Stats </h3>
+  <div id="stats"></div>
+  <h3> Video </h3>
+  <div id="remoteVideos"></div> <br />
+  <h3> Logs </h3>
+  <div id="logs"></div>
+</body>
+
+<script>
+  const pc = new RTCPeerConnection();
+  const log = msg => {
+    document.getElementById('logs').innerHTML += msg + '<br>'
+  }
+
+  pc.ontrack = function (event) {
+    const el = document.createElement(event.track.kind)
+    el.srcObject = event.streams[0]
+    el.autoplay = true
+    el.controls = true
+    document.getElementById('remoteVideos').appendChild(el)
+  }
+  var ready = false;
+  pc.oniceconnectionstatechange = e => log(pc.iceConnectionState)
+  pc.onicecandidate = event => {
+    if (event.candidate === null) {
+      log('Offer Ready.')
+      ready = true;
+      document.getElementById('start').disabled = false;
+    }
+  }
+
+  // Offer to receive 1 audio, and 1 video track
+  pc.addTransceiver('video', {
+    direction: 'sendrecv'
+  })
+  pc.addTransceiver('audio', {
+    direction: 'sendrecv'
+  })
+
+  pc.createOffer().then(d => pc.setLocalDescription(d)).catch(log)
+  log('createOffer')
+
+  window.startSession = () => {
+    let codec = document.getElementById('codec').value;
+    fetch('/offer?codec=' + codec, {
+      method: 'post',
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(pc.localDescription)
+    })
+      .then(res => res.json())
+      .then(res => pc.setRemoteDescription(res))
+      .catch(log)
+  }
+  setInterval(async () => {
+    let statsDom = document.getElementById('stats');
+    
+
+    let stats = await pc.getStats()
+    let codecMap = {};
+    for (let item of stats.entries()) {
+      console.log(item)
+      if (item[1].type === 'codec') {
+        codecMap[item[0]] = item[1]
+      }
+    }
+    let content = '';
+    for (let item of stats.entries()) {
+      let info = item[1];
+      if (info.type === 'inbound-rtp') {
+        content += 'Stream: ' + JSON.stringify(info) + '<br>'
+        content += 'Codec: ' + JSON.stringify(codecMap[info.codecId]) + '<br>'
+      }
+    }
+    statsDom.innerHTML = content;
+  }, 1000)
+</script>
+
+</html>
