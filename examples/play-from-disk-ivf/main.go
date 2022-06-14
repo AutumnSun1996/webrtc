@@ -27,15 +27,25 @@ var (
 		"vp9": webrtc.MimeTypeVP9,
 		"av1": webrtc.MimeTypeAV1,
 	}
-	peerConnection *webrtc.PeerConnection
+	quickExit = true
 )
 
-func createPeerConnection(codec string, offer webrtc.SessionDescription) *webrtc.SessionDescription {
+func ShouldExit(state webrtc.ICEConnectionState) bool {
+	if quickExit && state == webrtc.ICEConnectionStateDisconnected {
+		return true
+	}
+	if state == webrtc.ICEConnectionStateFailed || state == webrtc.ICEConnectionStateClosed {
+		return true
+	}
+	return false
+}
+
+func createPeerConnection(codec string, offer webrtc.SessionDescription) (answer webrtc.SessionDescription) {
 	// Create a MediaEngine object to configure the supported codec
 	m := &webrtc.MediaEngine{}
 
 	// Setup the codecs you want to use.
-	// We'll use a AV1 but you can also define your own
+	// We'll use AV1 but you can also define your own
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeAV1, ClockRate: 90000, Channels: 0, SDPFmtpLine: "", RTCPFeedback: nil},
 		PayloadType:        41,
@@ -88,10 +98,16 @@ func createPeerConnection(codec string, offer webrtc.SessionDescription) *webrtc
 			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
 				return
 			}
+			if ShouldExit(peerConnection.ICEConnectionState()) {
+				return
+			}
 		}
 	}()
 
 	go func() {
+		// Wait for connection established
+		<-iceConnectedCtx.Done()
+
 		// Open a IVF file and start reading using our IVFReader
 		file, ivfErr := os.Open(codec + ".ivf")
 		if ivfErr != nil {
@@ -103,9 +119,6 @@ func createPeerConnection(codec string, offer webrtc.SessionDescription) *webrtc
 			panic(ivfErr)
 		}
 
-		// Wait for connection established
-		<-iceConnectedCtx.Done()
-
 		idx := 0
 		// Send our video file frame at a time. Pace our sending so we send it at the same speed it should be played back as.
 		// This isn't required since the video is timestamped, but we will such much higher loss if we send all at once.
@@ -113,12 +126,17 @@ func createPeerConnection(codec string, offer webrtc.SessionDescription) *webrtc
 		// It is important to use a time.Ticker instead of time.Sleep because
 		// * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
 		// * works around latency issues with Sleep (see https://github.com/golang/go/issues/44343)
-		ticker := time.NewTicker(time.Millisecond * time.Duration((float32(header.TimebaseNumerator)/float32(header.TimebaseDenominator))*1000))
+		frameDuration := time.Millisecond * time.Duration((float32(header.TimebaseNumerator)/float32(header.TimebaseDenominator))*1000)
+		ticker := time.NewTicker(frameDuration)
 		for ; true; <-ticker.C {
+			if ShouldExit(peerConnection.ICEConnectionState()) {
+				return
+			}
 			frame, _, ivfErr := ivf.ParseNextFrame()
 			if errors.Is(ivfErr, io.EOF) {
 				fmt.Printf("All video frames parsed and sent.\n")
 				if loop {
+					// If loop is on, seek back to start and send frames again
 					file.Seek(0, 0)
 					ivf, header, ivfErr = ivfreader.NewWith(file)
 					if ivfErr == nil {
@@ -137,7 +155,7 @@ func createPeerConnection(codec string, offer webrtc.SessionDescription) *webrtc
 			if idx%30 == 0 {
 				log.Printf("Send Frame %d\n", idx)
 			}
-			if ivfErr = videoTrack.WriteSample(media.Sample{Data: frame, Duration: time.Second}); ivfErr != nil {
+			if ivfErr = videoTrack.WriteSample(media.Sample{Data: frame, Duration: frameDuration}); ivfErr != nil {
 				panic(ivfErr)
 			}
 		}
@@ -149,6 +167,13 @@ func createPeerConnection(codec string, offer webrtc.SessionDescription) *webrtc
 		fmt.Printf("Connection State has changed %s \n", connectionState.String())
 		if connectionState == webrtc.ICEConnectionStateConnected {
 			iceConnectedCtxCancel()
+		} else if ShouldExit(peerConnection.ICEConnectionState()) {
+			cErr := peerConnection.Close()
+			if cErr != nil {
+				fmt.Printf("cannot close peerConnection: %v\n", cErr)
+			} else {
+				fmt.Printf("peerConnection closed\n")
+			}
 		}
 	})
 
@@ -172,11 +197,11 @@ func createPeerConnection(codec string, offer webrtc.SessionDescription) *webrtc
 	}
 
 	// Create answer
-	answer, err := peerConnection.CreateAnswer(nil)
+	answer, err = peerConnection.CreateAnswer(nil)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Answer:\n%s\n", answer.SDP)
+	// fmt.Printf("Answer:\n%s\n", answer.SDP)
 
 	// Create channel that is blocked until ICE Gathering is complete
 	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
@@ -191,8 +216,8 @@ func createPeerConnection(codec string, offer webrtc.SessionDescription) *webrtc
 	// in a production application you should exchange ICE Candidates via OnICECandidate
 	<-gatherComplete
 
-	// Output the answer in base64 so we can paste it in browser
-	return peerConnection.LocalDescription()
+	// Return the answer
+	return *peerConnection.LocalDescription()
 }
 
 // Add a single video track
@@ -214,10 +239,6 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		panic("Could not find `" + videoFileName + "`")
 	}
 
-	if peerConnection != nil {
-		panic("peerConnection Exists!")
-	}
-
 	var offer webrtc.SessionDescription
 	if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
 		panic(err)
@@ -225,7 +246,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 
 	answer := createPeerConnection(codec, offer)
 
-	response, err := json.Marshal(*answer)
+	response, err := json.Marshal(answer)
 	if err != nil {
 		panic(err)
 	}
@@ -244,15 +265,6 @@ func main() {
 	go func() {
 		fmt.Println("Open http://localhost:8080 to access this demo")
 		panic(http.ListenAndServe(":8080", nil))
-	}()
-
-	defer func() {
-		if peerConnection == nil {
-			return
-		}
-		if cErr := peerConnection.Close(); cErr != nil {
-			fmt.Printf("cannot close peerConnection: %v\n", cErr)
-		}
 	}()
 
 	// Block forever
